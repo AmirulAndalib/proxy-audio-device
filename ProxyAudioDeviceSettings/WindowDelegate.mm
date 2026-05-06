@@ -22,6 +22,7 @@ int onDevicesChanged(AudioObjectID inObjectID,
     self.proxiedDeviceIsActiveRadioButton.enabled = NO;
     self.userIsActiveRadioButton.enabled = NO;
     self.alwaysRadioButton.enabled = NO;
+    self.hideWhenUnavailableCheckbox.enabled = NO;
     initializationAttemptInterval = 3;
     [self keepTryingToInitializeUntilSuccess];
 }
@@ -69,6 +70,9 @@ int onDevicesChanged(AudioObjectID inObjectID,
     self.proxiedDeviceIsActiveRadioButton.enabled = YES;
     self.userIsActiveRadioButton.enabled = YES;
     self.alwaysRadioButton.enabled = YES;
+    self.hideWhenUnavailableCheckbox.enabled = YES;
+    self.hideWhenUnavailableCheckbox.state =
+        [self currentHideWhenUnavailable] ? NSControlStateValueOn : NSControlStateValueOff;
 
     ProxyAudioDevice::ActiveCondition condition = [self currentOutputDeviceActiveCondition];
 
@@ -279,6 +283,29 @@ int onDevicesChanged(AudioObjectID inObjectID,
     self.proxiedDeviceIsActiveRadioButton.state = NSControlStateValueOff;
     self.userIsActiveRadioButton.state = NSControlStateValueOff;
     [self setCurrentOutputDeviceActiveCondition:ProxyAudioDevice::ActiveCondition::always];
+}
+
+// The driver reports this preference as "1" or "0" (see copyConfigurationValue
+// in ProxyAudioDevice.cpp). Anything non-"1" is treated as false.
+- (bool)currentHideWhenUnavailable {
+    AudioDeviceID proxyAudioBox = AudioDevice::audioDeviceIDForBoxUID(CFSTR(kBox_UID));
+    AudioDevice::setIdentifyValue(proxyAudioBox, -((SInt32)ProxyAudioDevice::ConfigType::deviceHideWhenUnavailable));
+    NSString *result = (__bridge_transfer NSString *)AudioDevice::copyObjectName(proxyAudioBox);
+
+    return [result intValue] != 0;
+}
+
+- (void)setCurrentHideWhenUnavailable:(bool)hide {
+    AudioDeviceID proxyAudioBox = AudioDevice::audioDeviceIDForBoxUID(CFSTR(kBox_UID));
+    AudioDevice::setObjectName(
+        proxyAudioBox,
+        (__bridge_retained CFStringRef)
+            [NSString stringWithFormat:@"outputDeviceHideWhenUnavailable=%d", hide ? 1 : 0]);
+}
+
+- (IBAction)hideWhenUnavailableToggled:(id)sender {
+    #pragma unused(sender)
+    [self setCurrentHideWhenUnavailable:(self.hideWhenUnavailableCheckbox.state == NSControlStateValueOn)];
 }
 
 @end

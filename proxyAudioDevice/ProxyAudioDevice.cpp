@@ -570,6 +570,7 @@ OSStatus ProxyAudioDevice::Initialize(AudioServerPlugInDriverRef inDriver, Audio
     outputDeviceUID = copyOutputDeviceUIDFromStorage();
     outputDeviceBufferFrameSize = retrieveOutputDeviceBufferFrameSizeFromStorage();
     outputDeviceActiveCondition = retrieveOutputDeviceActiveConditionFromStorage();
+    outputDeviceHideWhenUnavailable = retrieveOutputDeviceHideWhenUnavailableFromStorage();
 
     //    calculate the host ticks per frame
     struct mach_timebase_info theTimeBaseInfo;
@@ -3036,13 +3037,18 @@ OSStatus ProxyAudioDevice::GetDevicePropertyData(AudioServerPlugInDriverRef inDr
 
         case kAudioDevicePropertyIsHidden:
             //    This returns whether or not the device is visible to clients.
-            //    Hide the proxy device when the target output device is unavailable.
+            //    Hide the proxy device when the target output device is unavailable,
+            //    but only if the user has opted in via the "hide when unavailable"
+            //    setting. By default the device always stays visible, which matches
+            //    the long-standing behavior for users that rely on the proxy device
+            //    as a stable target (e.g. for apps that don't react well to devices
+            //    appearing and disappearing).
             FailWithAction(inDataSize < sizeof(UInt32),
                            theAnswer = kAudioHardwareBadPropertySizeError,
                            Done,
                            "GetDevicePropertyData: not enough space for the return value of "
                            "kAudioDevicePropertyIsHidden for the device");
-            *((UInt32 *)outData) = outputDeviceReady ? 0 : 1;
+            *((UInt32 *)outData) = (outputDeviceHideWhenUnavailable && !outputDeviceReady) ? 1 : 0;
             *outDataSize = sizeof(UInt32);
             break;
 
@@ -4846,15 +4852,7 @@ void ProxyAudioDevice::matchOutputDeviceSampleRateNoLock() {
     if (currentInputSampleRate == outputDevice.sampleRate) {
         outputDeviceReady = true;
         updateOutputDeviceStartedState();
-        
-        // Notify that the device is now visible since target device is available
-        ExecuteInAudioOutputThread(^() {
-            AudioObjectPropertyAddress theAddress = {kAudioDevicePropertyIsHidden,
-                                                     kAudioObjectPropertyScopeGlobal,
-                                                     kAudioObjectPropertyElementMaster};
-            gPlugIn_Host->PropertiesChanged(gPlugIn_Host, kObjectID_Device, 1, &theAddress);
-        });
-
+        notifyHiddenPropertyChanged();
         return;
     }
 
@@ -4862,17 +4860,10 @@ void ProxyAudioDevice::matchOutputDeviceSampleRateNoLock() {
     // NB: it's important that we not modify OutputDevice until it is no longer playing since
     // we're not using a locking mechanism on its attributes between this function and its IO
     // function.
-    
+
     outputDeviceReady = false;
     updateOutputDeviceStartedState();
-
-    // Notify that device is now hidden during sample rate transition
-    ExecuteInAudioOutputThread(^() {
-        AudioObjectPropertyAddress theAddress = {kAudioDevicePropertyIsHidden,
-                                                 kAudioObjectPropertyScopeGlobal,
-                                                 kAudioObjectPropertyElementMaster};
-        gPlugIn_Host->PropertiesChanged(gPlugIn_Host, kObjectID_Device, 1, &theAddress);
-    });
+    notifyHiddenPropertyChanged();
 
     resetInputData();
     outputDevice.updateStreamInfo();
@@ -4961,15 +4952,8 @@ void ProxyAudioDevice::deinitializeOutputDeviceNoLock() {
         DebugMsg("ProxyAudio: deinitializeOutputDeviceNoLock stopping device");
         outputDevice.stop();
         outputDeviceReady = false;
-        
-        // Notify that the device is now hidden since target device is unavailable
-        ExecuteInAudioOutputThread(^() {
-            AudioObjectPropertyAddress theAddress = {kAudioDevicePropertyIsHidden,
-                                                     kAudioObjectPropertyScopeGlobal,
-                                                     kAudioObjectPropertyElementMaster};
-            gPlugIn_Host->PropertiesChanged(gPlugIn_Host, kObjectID_Device, 1, &theAddress);
-        });
-        
+        notifyHiddenPropertyChanged();
+
         DebugMsg("ProxyAudio: deinitializeOutputDeviceNoLock removing IO proc");
         outputDevice.destroyIOProc();
         DebugMsg("ProxyAudio: deinitializeOutputDeviceNoLock invalidating");
@@ -5531,6 +5515,8 @@ void ProxyAudioDevice::parseConfigurationString(CFStringRef configString, Config
         action = ConfigType::deviceName;
     } else if (CFStringCompare(actionString, CFSTR("outputDeviceActiveCondition"), 0) == kCFCompareEqualTo) {
         action = ConfigType::deviceActiveCondition;
+    } else if (CFStringCompare(actionString, CFSTR("outputDeviceHideWhenUnavailable"), 0) == kCFCompareEqualTo) {
+        action = ConfigType::deviceHideWhenUnavailable;
     } else {
         return;
     }
@@ -5565,7 +5551,12 @@ void ProxyAudioDevice::setConfigurationValue(ConfigType type, CFStringRef value)
         case ConfigType::deviceActiveCondition:
             setOutputDeviceActiveCondition((ActiveCondition)CFStringGetIntValue(value));
             break;
-        
+
+        case ConfigType::deviceHideWhenUnavailable:
+            // Configurator passes "1" for true and "0" for false.
+            setOutputDeviceHideWhenUnavailable(CFStringGetIntValue(value) != 0);
+            break;
+
         default:
             break;
     }
@@ -5586,7 +5577,10 @@ CFStringRef ProxyAudioDevice::copyConfigurationValue(ConfigType type) {
 
         case ConfigType::deviceActiveCondition:
             return CFStringCreateWithFormat(NULL, NULL, CFSTR("%u"), outputDeviceActiveCondition);
-            
+
+        case ConfigType::deviceHideWhenUnavailable:
+            return CFStringCreateWithFormat(NULL, NULL, CFSTR("%u"), outputDeviceHideWhenUnavailable ? 1 : 0);
+
         default:
             return nullptr;
     }
@@ -5803,6 +5797,54 @@ void ProxyAudioDevice::setOutputDeviceActiveCondition(ActiveCondition newActiveC
         CFNumberSmartRef newActiveConditionRef = CFNumberCreate(NULL, kCFNumberSInt32Type, &newActiveCondition);
         gPlugIn_Host->WriteToStorage(gPlugIn_Host, CFSTR("outputDeviceActiveCondition"), newActiveConditionRef);
     }
+}
+
+bool ProxyAudioDevice::retrieveOutputDeviceHideWhenUnavailableFromStorage() {
+    DebugMsg("ProxyAudio: retrieveOutputDeviceHideWhenUnavailableFromStorage");
+
+    if (!gPlugIn_Host) {
+        DebugMsg("ProxyAudio: retrieveOutputDeviceHideWhenUnavailableFromStorage no plugin host");
+        return kOutputDeviceDefaultHideWhenUnavailable;
+    }
+
+    CFPropertyListSmartRef data;
+    gPlugIn_Host->CopyFromStorage(gPlugIn_Host, CFSTR("outputDeviceHideWhenUnavailable"), &data);
+
+    if (data == NULL || CFGetTypeID(data) != CFBooleanGetTypeID()) {
+        DebugMsg("ProxyAudio: retrieveOutputDeviceHideWhenUnavailableFromStorage finished returning default value");
+        return kOutputDeviceDefaultHideWhenUnavailable;
+    }
+
+    return CFBooleanGetValue(CFBooleanRef(CFPropertyListRef(data)));
+}
+
+void ProxyAudioDevice::setOutputDeviceHideWhenUnavailable(bool newHideWhenUnavailable) {
+    {
+        CAMutex::Locker locker(&stateMutex);
+        outputDeviceHideWhenUnavailable = newHideWhenUnavailable;
+        gPlugIn_Host->WriteToStorage(gPlugIn_Host,
+                                     CFSTR("outputDeviceHideWhenUnavailable"),
+                                     newHideWhenUnavailable ? kCFBooleanTrue : kCFBooleanFalse);
+    }
+
+    // Toggling the setting changes the effective hidden state, so let the host
+    // re-query kAudioDevicePropertyIsHidden immediately instead of waiting for
+    // the next device-availability transition.
+    notifyHiddenPropertyChanged();
+}
+
+// Tell the host to re-read kAudioDevicePropertyIsHidden. We always notify,
+// even when the "hide when unavailable" setting is off, so that toggling the
+// setting or having the target device come and go is picked up immediately.
+// With the setting off the getter always returns 0, so the notification is
+// harmless (the host just sees the same value it already had).
+void ProxyAudioDevice::notifyHiddenPropertyChanged() {
+    ExecuteInAudioOutputThread(^() {
+        AudioObjectPropertyAddress theAddress = {kAudioDevicePropertyIsHidden,
+                                                 kAudioObjectPropertyScopeGlobal,
+                                                 kAudioObjectPropertyElementMaster};
+        gPlugIn_Host->PropertiesChanged(gPlugIn_Host, kObjectID_Device, 1, &theAddress);
+    });
 }
 
 #pragma mark Other stuff!
