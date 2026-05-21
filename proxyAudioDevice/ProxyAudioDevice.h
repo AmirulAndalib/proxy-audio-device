@@ -29,10 +29,20 @@ enum {
 #define kOutputDeviceDefaultBufferFrameSize 512
 #define kOutputDeviceMinBufferFrameSize 4
 #define kOutputDeviceDefaultActiveCondition ActiveCondition::userActive
+// Default to false so the proxy device stays visible even when the target is
+// unavailable. This preserves the long-standing behavior for existing users.
+#define kOutputDeviceDefaultHideWhenUnavailable false
 
 class ProxyAudioDevice {
   public:
-    enum class ConfigType { none, outputDevice, outputDeviceBufferFrameSize, deviceName, deviceActiveCondition };
+    enum class ConfigType {
+        none,
+        outputDevice,
+        outputDeviceBufferFrameSize,
+        deviceName,
+        deviceActiveCondition,
+        deviceHideWhenUnavailable
+    };
     enum class ActiveCondition { proxiedDeviceActive = 0, userActive = 1, always = 2 };
 
     ProxyAudioDevice() : inputIOIsActive(false) {};
@@ -98,6 +108,9 @@ class ProxyAudioDevice {
     void setOutputDeviceBufferFrameSize(UInt32 size);
     ActiveCondition retrieveOutputDeviceActiveConditionFromStorage();
     void setOutputDeviceActiveCondition(ActiveCondition newActiveCondition);
+    bool retrieveOutputDeviceHideWhenUnavailableFromStorage();
+    void setOutputDeviceHideWhenUnavailable(bool newHideWhenUnavailable);
+    void notifyHiddenPropertyChanged();
 
     static ProxyAudioDevice *deviceForDriver(void *inDriver);
 
@@ -497,6 +510,7 @@ class ProxyAudioDevice {
     Float64 outputAccumulatedRateRatio = 0.0;
     UInt64 outputAccumulatedRateRatioSamples = 0;
     ActiveCondition outputDeviceActiveCondition = ActiveCondition::userActive;
+    bool outputDeviceHideWhenUnavailable = kOutputDeviceDefaultHideWhenUnavailable;
     
     UInt32 gPlugIn_RefCount = 0;
     AudioServerPlugInHostRef gPlugIn_Host = NULL;
